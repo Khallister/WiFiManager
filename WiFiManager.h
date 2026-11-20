@@ -478,6 +478,32 @@ class WiFiManager
     // helper to get saved ssid, if persistent get stored, else get current if connected
     String        getWiFiSSID(bool persistent = true);
 
+    #if defined(WM_HEADLESS) && defined(ESP32)
+    // ---- [Smart Intercom fork] headless provisioning primitives (ESP32 only) ----
+    // In a WM_HEADLESS build the application serves its own UI on its own HTTP server and
+    // drives provisioning through these non-blocking calls instead of /wifisave.
+    // None of them waits for a connection result: poll WiFi.status() and
+    // getLastDisconnectReason() from the application loop.
+
+    // Starts a station connection to a NEW network while keeping the soft AP up. The
+    // credentials are held in RAM only; the previously saved network stays in NVS until
+    // saveConnectedCredentials() is called after the connection has been confirmed.
+    bool          beginConnectWithoutSaving(const char* ssid, const char* pass);
+
+    // Persists the station configuration that is currently connected (call only after
+    // WiFi.status() == WL_CONNECTED). Restores flash storage for later WiFi API calls.
+    bool          saveConnectedCredentials();
+
+    // Abandons an attempt started with beginConnectWithoutSaving(): the RAM configuration
+    // is replaced by the previously saved one again and flash storage is restored.
+    bool          restoreSavedCredentials();
+
+    // Last station disconnect reason (wifi_err_reason_t) seen by the event handler, 0 = none.
+    // Updated from the WiFi event task; reading a uint8_t is atomic on ESP32.
+    uint8_t       getLastDisconnectReason();
+    void          clearLastDisconnectReason();
+    #endif
+
     // debug output the softap config
     void          debugSoftAPConfig();
 
@@ -584,6 +610,11 @@ class WiFiManager
     #ifdef ESP32
     wifi_event_id_t wm_event_id           = 0;
     static uint8_t _lastconxresulttmp; // tmp var for esp32 callback
+    #ifdef WM_HEADLESS
+    static volatile uint8_t _lastDisconnectReason; // [Smart Intercom fork] set in WiFiEvent
+    bool          _savedConfigStashed     = false;  // [Smart Intercom fork]
+    wifi_config_t _savedStaConfig         = {};     // [Smart Intercom fork] restore point
+    #endif
     #endif
 
     #ifndef WL_STATION_WRONG_PASSWORD

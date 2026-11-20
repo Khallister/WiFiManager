@@ -16,6 +16,9 @@
 
 #ifdef ESP32
 uint8_t WiFiManager::_lastconxresulttmp = WL_IDLE_STATUS;
+#ifdef WM_HEADLESS
+volatile uint8_t WiFiManager::_lastDisconnectReason = 0;
+#endif
 #endif
 
 /**
@@ -617,6 +620,15 @@ boolean WiFiManager::configPortalHasTimeout(){
 
 void WiFiManager::setupHTTPServer(){
 
+  #ifdef WM_HEADLESS
+  // [Smart Intercom fork] Headless build: the application owns the only HTTP server and
+  // its UI. No WiFiManager server, no HTML pages, no /wifisave, /erase, /update, /exit ...
+  // routes exist in this build, so they cannot be used to bypass the application's auth.
+  #ifdef WM_DEBUG_LEVEL
+  DEBUG_WM(WM_DEBUG_VERBOSE,F("Headless portal: built-in HTTP server disabled"));
+  #endif
+  #else
+
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(F("Starting Web Portal"));
   #endif
@@ -662,6 +674,7 @@ void WiFiManager::setupHTTPServer(){
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(WM_DEBUG_VERBOSE,F("HTTP server started"));
   #endif
+  #endif // WM_HEADLESS
 }
 
 void WiFiManager::setupDNSD(){
@@ -869,7 +882,7 @@ uint8_t WiFiManager::processConfigPortal(){
     }
 
     //HTTP handler
-    server->handleClient();
+    if(server) server->handleClient(); // [Smart Intercom fork] null in headless builds
 
     // Waiting for save...
     if(connect) {
@@ -966,13 +979,16 @@ bool WiFiManager::shutdownConfigPortal(){
     dnsServer->processNextRequest();
   }
 
-  //HTTP handler
-  server->handleClient();
+  // [Smart Intercom fork] the server is null in headless builds
+  if(server){
+    //HTTP handler
+    server->handleClient();
 
-  // @todo what is the proper way to shutdown and free the server up
-  // debug - many open issues aobut port not clearing for use with other servers
-  server->stop();
-  server.reset();
+    // @todo what is the proper way to shutdown and free the server up
+    // debug - many open issues aobut port not clearing for use with other servers
+    server->stop();
+    server.reset();
+  }
 
   WiFi.scanDelete(); // free wifi scan results
 
@@ -1106,7 +1122,7 @@ bool WiFiManager::wifiConnectNew(String ssid, String pass,bool connect){
   #ifdef WM_DEBUG_LEVEL
   // DEBUG_WM(WM_DEBUG_DEV,F("CONNECTED: "),WiFi.status() == WL_CONNECTED ? "Y" : "NO");
   DEBUG_WM(F("Connecting to NEW AP:"),ssid);
-  DEBUG_WM(WM_DEBUG_DEV,F("Using Password:"),pass);
+  DEBUG_WM(WM_DEBUG_DEV,F("Using Password:"),F("<hidden>")); // [Smart Intercom fork] never log secrets
   #endif
   WiFi_enableSTA(true,storeSTAmode); // storeSTAmode will also toggle STA on in default opmode (persistent) if true (default)
   WiFi.persistent(true);
@@ -1128,7 +1144,7 @@ bool WiFiManager::wifiConnectDefault(){
 
   #ifdef WM_DEBUG_LEVEL
   DEBUG_WM(F("Connecting to SAVED AP:"),WiFi_SSID(true));
-  DEBUG_WM(WM_DEBUG_DEV,F("Using Password:"),WiFi_psk(true));
+  DEBUG_WM(WM_DEBUG_DEV,F("Using Password:"),F("<hidden>")); // [Smart Intercom fork] never log secrets
   #endif
 
   ret = WiFi_enableSTA(true,storeSTAmode);
@@ -3536,7 +3552,7 @@ boolean WiFiManager::validApPassword(){
     }
     #ifdef WM_DEBUG_LEVEL
     DEBUG_WM(WM_DEBUG_VERBOSE,F("AccessPoint set password is VALID"));
-    DEBUG_WM(WM_DEBUG_DEV,"ap pass",_apPassword);
+    // [Smart Intercom fork] the AP password is never written to the debug log
     #endif
   }
   return true;
@@ -3850,6 +3866,12 @@ String WiFiManager::WiFi_psk(bool persistent) const {
     #define ARDUINO_EVENT_WIFI_STA_DISCONNECTED SYSTEM_EVENT_STA_DISCONNECTED
     #define ARDUINO_EVENT_WIFI_SCAN_DONE SYSTEM_EVENT_SCAN_DONE
   #endif
+    #ifdef WM_HEADLESS
+    // [Smart Intercom fork] keep the reason even outside portal sessions (headless API)
+    if(event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED){
+      _lastDisconnectReason = (uint8_t)info.wifi_sta_disconnected.reason;
+    }
+    #endif
     if(!_hasBegun){
       #ifdef WM_DEBUG_LEVEL
         // DEBUG_WM(WM_DEBUG_VERBOSE,"[ERROR] WiFiEvent, not ready");
@@ -3887,6 +3909,77 @@ String WiFiManager::WiFi_psk(bool persistent) const {
     uint16_t scans = WiFi.scanComplete();
     WiFi_scanComplete(scans);
   }
+}
+#endif
+
+#if defined(WM_HEADLESS) && defined(ESP32)
+// ---- [Smart Intercom fork] headless provisioning primitives ----
+// Arduino-ESP32 selects the Wi-Fi config storage (RAM/flash) once, at driver init, and a
+// plain WiFi.begin() writes the new network to NVS before it is known to work. These
+// helpers switch the driver to RAM storage for the attempt and only write the network to
+// flash once the application has seen WL_CONNECTED, so a typo in the password can never
+// replace a working saved network.
+
+bool WiFiManager::beginConnectWithoutSaving(const char* ssid, const char* pass){
+  if(ssid == nullptr || ssid[0] == '\0') return false;
+  _begin();
+  WiFi_autoReconnect(); // make sure the event handler that records disconnect reasons runs
+
+  // keep the AP (if any) and enable the station next to it
+  if(!WiFi.enableSTA(true)) return false;
+
+  if(!_savedConfigStashed){
+    // restore point: whatever the driver currently holds (loaded from NVS at init)
+    if(esp_wifi_get_config(WIFI_IF_STA, &_savedStaConfig) != ESP_OK) return false;
+    _savedConfigStashed = true;
+  }
+
+  // an ongoing connect makes esp_wifi_set_config() fail with ESP_ERR_WIFI_STATE
+  esp_wifi_disconnect();
+  if(esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK) return false;
+  _lastDisconnectReason = 0;
+  _lastconxresulttmp = WL_IDLE_STATUS;
+
+  #ifdef WM_DEBUG_LEVEL
+  DEBUG_WM(F("Headless connect (not saved yet) to:"),ssid);
+  #endif
+  return WiFi.begin(ssid, (pass != nullptr && pass[0] != '\0') ? pass : nullptr) != WL_CONNECT_FAILED;
+}
+
+bool WiFiManager::saveConnectedCredentials(){
+  wifi_config_t conf = {};
+  if(esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return false;
+  if(esp_wifi_set_storage(WIFI_STORAGE_FLASH) != ESP_OK) return false;
+  // with flash storage selected, setting the (unchanged) config writes it to NVS
+  const bool ok = esp_wifi_set_config(WIFI_IF_STA, &conf) == ESP_OK;
+  _savedConfigStashed = false;
+  #ifdef WM_DEBUG_LEVEL
+  DEBUG_WM(ok ? F("Headless connect: credentials saved") : F("[ERROR] Headless connect: save failed"));
+  #endif
+  return ok;
+}
+
+bool WiFiManager::restoreSavedCredentials(){
+  bool ok = true;
+  esp_wifi_disconnect();
+  if(_savedConfigStashed){
+    // still RAM storage: put the previous network back without touching NVS
+    ok = esp_wifi_set_config(WIFI_IF_STA, &_savedStaConfig) == ESP_OK;
+    _savedConfigStashed = false;
+  }
+  ok = (esp_wifi_set_storage(WIFI_STORAGE_FLASH) == ESP_OK) && ok;
+  #ifdef WM_DEBUG_LEVEL
+  DEBUG_WM(ok ? F("Headless connect: previous network restored") : F("[ERROR] Headless connect: restore failed"));
+  #endif
+  return ok;
+}
+
+uint8_t WiFiManager::getLastDisconnectReason(){
+  return _lastDisconnectReason;
+}
+
+void WiFiManager::clearLastDisconnectReason(){
+  _lastDisconnectReason = 0;
 }
 #endif
 
