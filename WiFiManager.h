@@ -486,17 +486,11 @@ class WiFiManager
     // getLastDisconnectReason() from the application loop.
 
     // Starts a station connection to a NEW network while keeping the soft AP up. The
-    // credentials are held in RAM only; the previously saved network stays in NVS until
-    // saveConnectedCredentials() is called after the connection has been confirmed.
+    // driver is switched to RAM storage first, so the network is never written to the
+    // driver's NVS area. Persisting a confirmed network is the application's job: the
+    // driver cannot do it afterwards, because esp_wifi_set_config() with an unchanged
+    // config (already applied in RAM) writes nothing to flash.
     bool          beginConnectWithoutSaving(const char* ssid, const char* pass);
-
-    // Persists the station configuration that is currently connected (call only after
-    // WiFi.status() == WL_CONNECTED). Restores flash storage for later WiFi API calls.
-    bool          saveConnectedCredentials();
-
-    // Abandons an attempt started with beginConnectWithoutSaving(): the RAM configuration
-    // is replaced by the previously saved one again and flash storage is restored.
-    bool          restoreSavedCredentials();
 
     // Last station disconnect reason (wifi_err_reason_t) seen by the event handler, 0 = none.
     // Updated from the WiFi event task; reading a uint8_t is atomic on ESP32.
@@ -612,8 +606,6 @@ class WiFiManager
     static uint8_t _lastconxresulttmp; // tmp var for esp32 callback
     #ifdef WM_HEADLESS
     static volatile uint8_t _lastDisconnectReason; // [Smart Intercom fork] set in WiFiEvent
-    bool          _savedConfigStashed     = false;  // [Smart Intercom fork]
-    wifi_config_t _savedStaConfig         = {};     // [Smart Intercom fork] restore point
     #endif
     #endif
 

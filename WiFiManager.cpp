@@ -3915,10 +3915,14 @@ String WiFiManager::WiFi_psk(bool persistent) const {
 #if defined(WM_HEADLESS) && defined(ESP32)
 // ---- [Smart Intercom fork] headless provisioning primitives ----
 // Arduino-ESP32 selects the Wi-Fi config storage (RAM/flash) once, at driver init, and a
-// plain WiFi.begin() writes the new network to NVS before it is known to work. These
-// helpers switch the driver to RAM storage for the attempt and only write the network to
-// flash once the application has seen WL_CONNECTED, so a typo in the password can never
-// replace a working saved network.
+// plain WiFi.begin() with flash storage writes the new network to NVS before it is known
+// to work. This helper forces RAM storage for the attempt; the application persists the
+// network itself once it has seen WL_CONNECTED (Smart Intercom: WifiCredentialStore).
+//
+// Do NOT try to persist afterwards with esp_wifi_set_storage(WIFI_STORAGE_FLASH) +
+// esp_wifi_set_config(same config): the driver only writes fields that differ from its
+// current (RAM) config, so nothing reaches flash although both calls return ESP_OK
+// (the cause of the "Wi-Fi forgotten after restart" bug fixed in the Smart Intercom fork).
 
 bool WiFiManager::beginConnectWithoutSaving(const char* ssid, const char* pass){
   if(ssid == nullptr || ssid[0] == '\0') return false;
@@ -3928,12 +3932,6 @@ bool WiFiManager::beginConnectWithoutSaving(const char* ssid, const char* pass){
   // keep the AP (if any) and enable the station next to it
   if(!WiFi.enableSTA(true)) return false;
 
-  if(!_savedConfigStashed){
-    // restore point: whatever the driver currently holds (loaded from NVS at init)
-    if(esp_wifi_get_config(WIFI_IF_STA, &_savedStaConfig) != ESP_OK) return false;
-    _savedConfigStashed = true;
-  }
-
   // an ongoing connect makes esp_wifi_set_config() fail with ESP_ERR_WIFI_STATE
   esp_wifi_disconnect();
   if(esp_wifi_set_storage(WIFI_STORAGE_RAM) != ESP_OK) return false;
@@ -3941,37 +3939,9 @@ bool WiFiManager::beginConnectWithoutSaving(const char* ssid, const char* pass){
   _lastconxresulttmp = WL_IDLE_STATUS;
 
   #ifdef WM_DEBUG_LEVEL
-  DEBUG_WM(F("Headless connect (not saved yet) to:"),ssid);
+  DEBUG_WM(F("Headless connect (not saved) to:"),ssid);
   #endif
   return WiFi.begin(ssid, (pass != nullptr && pass[0] != '\0') ? pass : nullptr) != WL_CONNECT_FAILED;
-}
-
-bool WiFiManager::saveConnectedCredentials(){
-  wifi_config_t conf = {};
-  if(esp_wifi_get_config(WIFI_IF_STA, &conf) != ESP_OK) return false;
-  if(esp_wifi_set_storage(WIFI_STORAGE_FLASH) != ESP_OK) return false;
-  // with flash storage selected, setting the (unchanged) config writes it to NVS
-  const bool ok = esp_wifi_set_config(WIFI_IF_STA, &conf) == ESP_OK;
-  _savedConfigStashed = false;
-  #ifdef WM_DEBUG_LEVEL
-  DEBUG_WM(ok ? F("Headless connect: credentials saved") : F("[ERROR] Headless connect: save failed"));
-  #endif
-  return ok;
-}
-
-bool WiFiManager::restoreSavedCredentials(){
-  bool ok = true;
-  esp_wifi_disconnect();
-  if(_savedConfigStashed){
-    // still RAM storage: put the previous network back without touching NVS
-    ok = esp_wifi_set_config(WIFI_IF_STA, &_savedStaConfig) == ESP_OK;
-    _savedConfigStashed = false;
-  }
-  ok = (esp_wifi_set_storage(WIFI_STORAGE_FLASH) == ESP_OK) && ok;
-  #ifdef WM_DEBUG_LEVEL
-  DEBUG_WM(ok ? F("Headless connect: previous network restored") : F("[ERROR] Headless connect: restore failed"));
-  #endif
-  return ok;
 }
 
 uint8_t WiFiManager::getLastDisconnectReason(){
